@@ -1,0 +1,232 @@
+Parameters:
+  SubcriptionEmailId:
+    Description: Notification Subscription Email
+    Type: String
+    Default: maduranga.bbnt@gmail.com
+
+Resources:
+  ConfigDeliveryChannel:
+    Type: 'AWS::Config::DeliveryChannel'
+    Properties:
+      S3BucketName:
+        Ref: ConfigChangeRecordS3Bucket
+
+  ConfigRecorder:
+    Type: 'AWS::Config::ConfigurationRecorder'
+    Properties:
+      Name: default
+      RecordingGroup:
+        ResourceTypes:
+          - "AWS::S3::Bucket"
+      RoleARN: !GetAtt ConfigRecorderRole.Arn
+
+  ConfigRecorderRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - config.amazonaws.com
+                - s3.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref SampleManagedPolicy
+
+  SampleManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowConfigRecorderAccess
+            Effect: Allow
+            Action:
+              - config:BatchGet*
+              - config:Describe*
+              - config:Get*
+              - config:List*
+              - config:Put*
+              - config:Select*
+              - s3:GetAccelerateConfiguration
+              - s3:GetAccessPoint
+              - s3:GetAccountPublicAccessBlock
+              - s3:GetBucketAcl
+              - s3:GetBucketCORS
+              - s3:GetBucketLocation
+              - s3:GetBucketLogging
+              - s3:GetBucketNotification
+              - s3:GetBucketObjectLockConfiguration
+              - s3:GetBucketPolicy
+              - s3:GetBucketPublicAccessBlock
+              - s3:GetBucketRequestPayment
+              - s3:GetBucketTagging
+              - s3:GetBucketVersioning
+              - s3:GetBucketWebsite
+              - s3:GetEncryptionConfiguration
+              - s3:GetLifecycleConfiguration
+              - s3:GetReplicationConfiguration
+              - s3:ListAccessPoints
+              - s3:ListAllMyBuckets
+              - s3:ListBucket"
+            Resource: "*"
+
+  ConfigRuleForS3BucketLevelPublicAccessProhibited:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      Scope:
+        ComplianceResourceTypes:
+          - 'AWS::S3::Bucket'
+      Source:
+        Owner: AWS
+        SourceIdentifier: "S3_BUCKET_LEVEL_PUBLIC_ACCESS_PROHIBITED"
+    DependsOn:
+      - ConfigRecorder
+      - ConfigDeliveryChannel
+
+  S3PublicAccessEnabledAlarmTopic:
+    Type: 'AWS::SNS::Topic'
+  S3PublicAccessEnabledAlarmTopicSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      TopicArn: !Ref 'S3PublicAccessEnabledAlarmTopic'
+      Endpoint: !Ref SubcriptionEmailId
+      Protocol: email
+
+  SamplePublicAccessBlockS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: public-access-block-bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+        IgnorePublicAcls: true
+
+  ConfigChangeRecordS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: config-change-record-bucket
+
+  BlockS3PublicAccessEventsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: Call lambda to block s3 public access based on aws config rules
+      Name: block-s3-public-access-rule
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          messageType:
+            - ComplianceChangeNotification
+          resourceType:
+            - AWS::S3::Bucket
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt S3BlockPublicAccessLambda.Arn
+#          unique id (any string)
+          Id: 's3-public-access-block-lambda'
+          RetryPolicy:
+            MaximumRetryAttempts: 4
+
+  S3BlockPublicAccessLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt S3PublicAccessBlockLambdaFunctionRole.Arn
+      Environment:
+        Variables:
+          TopicArn: !Ref 'S3PublicAccessEnabledAlarmTopic'
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3 as boto3
+
+          s3_client = boto3.client('s3')
+          sns_client = boto3.client('sns')
+
+
+          def lambda_handler(event, context):
+              bucket_name = event['detail']['resourceId']
+              # new_result = 'NON_COMPLIANT'
+              # old_result = 'COMPLIANT'
+              new_result = event['detail']['newEvaluationResult']['complianceType']
+              old_result = event['detail']['oldEvaluationResult']['complianceType']
+
+              if new_result == 'NON_COMPLIANT':
+                  message = f'S3 BucketInRisk :{bucket_name}'
+                  response = sns_client.publish(
+                      TargetArn=os.environ.get('TopicArn'),
+                      Message=json.dumps({'default': json.dumps(message)}),
+                      MessageStructure='json'
+                  )
+
+                  print("Non Compliance S3 Rule")
+                  response_public = s3_client.put_public_access_block(
+                      Bucket=bucket_name,
+                      PublicAccessBlockConfiguration={
+                          'BlockPublicAcls': True,
+                          'IgnorePublicAcls': True,
+                          'BlockPublicPolicy': True,
+                          'RestrictPublicBuckets': True
+                      },
+                  )
+
+              else:
+                  print(f'Old event status:{old_result}')
+      Runtime: python3.8
+      Timeout: 5
+
+  PermissionForEventsToInvokeLambda:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName:
+        Ref: S3BlockPublicAccessLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BlockS3PublicAccessEventsRule.Arn
+
+  S3PublicAccessBlockLambdaFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: S3PublicAccessBlockLambdaFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+
+  AllowConfigToAccessS3BucketForLoggingPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ConfigChangeRecordS3Bucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: '*'
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref ConfigChangeRecordS3Bucket
+                - /*
+            Principal: '*'
